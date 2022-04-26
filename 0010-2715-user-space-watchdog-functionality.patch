@@ -1,0 +1,362 @@
+From dcddba54c8b65d6c4297268df0c7264e36bb3a85 Mon Sep 17 00:00:00 2001
+From: fzhao <fzhao@intrinsyc.com>
+Date: Wed, 10 Jun 2020 12:08:08 -0700
+Subject: [PATCH 10/10]   [2715]: user space watchdog functionality
+
+  msm-watchdog as a watchdog to monitor user space application.
+
+  modified:   arch/arm/boot/dts/qcom/msm8953.dtsi
+  modified:   drivers/soc/qcom/watchdog_v2.c
+
+Change-Id: Id8e1135cc7a489e1b1d5ca6a63f3890d954e6bc6
+---
+ arch/arm/boot/dts/qcom/msm8953.dtsi |   4 +-
+ drivers/soc/qcom/watchdog_v2.c      | 218 ++++++++++++++++++++++++----
+ 2 files changed, 190 insertions(+), 32 deletions(-)
+
+diff --git a/arch/arm/boot/dts/qcom/msm8953.dtsi b/arch/arm/boot/dts/qcom/msm8953.dtsi
+index 2c523daaaadf..d09aff9d5a7e 100644
+--- a/arch/arm/boot/dts/qcom/msm8953.dtsi
++++ b/arch/arm/boot/dts/qcom/msm8953.dtsi
+@@ -1192,8 +1192,8 @@
+ 		reg = <0xb017000 0x1000>;
+ 		reg-names = "wdt-base";
+ 		interrupts = <0 3 0>, <0 4 0>;
+-		qcom,bark-time = <11000>;
+-		qcom,pet-time = <10000>;
++		qcom,bark-time = <10000>;
++		qcom,pet-time = <9000>;
+ 		qcom,ipi-ping;
+ 		qcom,wakeup-enable;
+ 	};
+diff --git a/drivers/soc/qcom/watchdog_v2.c b/drivers/soc/qcom/watchdog_v2.c
+index d97ddd5fd2f3..cc328deee0da 100644
+--- a/drivers/soc/qcom/watchdog_v2.c
++++ b/drivers/soc/qcom/watchdog_v2.c
+@@ -26,6 +26,7 @@
+ #include <linux/cpu.h>
+ #include <linux/cpu_pm.h>
+ #include <linux/platform_device.h>
++#include <linux/qpnp/power-on.h>
+ #include <soc/qcom/scm.h>
+ #include <soc/qcom/memory_dump.h>
+ #include <soc/qcom/watchdog.h>
+@@ -51,6 +52,15 @@
+ 
+ static struct msm_watchdog_data *wdog_data;
+ 
++
++struct user_watchdog_data {
++	unsigned int pet_watchdog;
++	unsigned int reset_type;
++	unsigned int user_pettime;
++	unsigned long long last_user_pettime;
++};
++
++
+ static int cpu_idle_pc_state[NR_CPUS];
+ 
+ struct msm_watchdog_data {
+@@ -78,8 +88,11 @@ struct msm_watchdog_data {
+ 	struct task_struct *watchdog_task;
+ 	struct timer_list pet_timer;
+ 	struct completion pet_complete;
++	bool user_watchdog_mode;
++	struct user_watchdog_data userwd;
+ };
+ 
++
+ /*
+  * On the kernel command line specify
+  * watchdog_v2.enable=1 to enable the watchdog
+@@ -116,6 +129,7 @@ static int msm_watchdog_suspend(struct device *dev)
+ {
+ 	struct msm_watchdog_data *wdog_dd =
+ 			(struct msm_watchdog_data *)dev_get_drvdata(dev);
++
+ 	if (!enable)
+ 		return 0;
+ 	__raw_writel(1, wdog_dd->base + WDT0_RST);
+@@ -193,12 +207,47 @@ static void wdog_disable(struct msm_watchdog_data *wdog_dd)
+ 	pr_info("MSM Apps Watchdog deactivated.\n");
+ }
+ 
++static void pet_watchdog(struct msm_watchdog_data *wdog_dd)
++{
++	int slack, i, count, prev_count = 0;
++	unsigned long long time_ns;
++	unsigned long long slack_ns;
++	unsigned long long bark_time_ns = wdog_dd->bark_time * 1000000ULL;
++
++	for (i = 0; i < 2; i++) {
++		count = (__raw_readl(wdog_dd->base + WDT0_STS) >> 1) & 0xFFFFF;
++		if (count != prev_count) {
++			prev_count = count;
++			i = 0;
++		}
++	}
++
++	if (wdog_dd->user_watchdog_mode) {
++		unsigned long long ctime;
++		ctime = sched_clock() - wdog_dd->userwd.last_user_pettime;
++		do_div(ctime, 1000000);
++		if (ctime > wdog_dd->bark_time) {
++			pr_err("user watchdog bark!\n");
++			mdelay(wdog_dd->bark_time+1000);
++		}
++	}
++
++	slack = ((wdog_dd->bark_time * WDT_HZ) / 1000) - count;
++	if (slack < wdog_dd->min_slack_ticks)
++		wdog_dd->min_slack_ticks = slack;
++	__raw_writel(1, wdog_dd->base + WDT0_RST);
++	time_ns = sched_clock();
++	slack_ns = (wdog_dd->last_pet + bark_time_ns) - time_ns;
++	if (slack_ns < wdog_dd->min_slack_ns)
++		wdog_dd->min_slack_ns = slack_ns;
++	wdog_dd->last_pet = time_ns;
++}
++
+ static ssize_t wdog_disable_get(struct device *dev,
+ 				struct device_attribute *attr, char *buf)
+ {
+ 	int ret;
+ 	struct msm_watchdog_data *wdog_dd = dev_get_drvdata(dev);
+-
+ 	mutex_lock(&wdog_dd->disable_lock);
+ 	ret = snprintf(buf, PAGE_SIZE, "%d\n", enable == 0 ? 1 : 0);
+ 	mutex_unlock(&wdog_dd->disable_lock);
+@@ -209,7 +258,7 @@ static ssize_t wdog_disable_set(struct device *dev,
+ 				struct device_attribute *attr,
+ 				const char *buf, size_t count)
+ {
+-	int ret;
++	int ret = 0;
+ 	u8 disable;
+ 	struct msm_watchdog_data *wdog_dd = dev_get_drvdata(dev);
+ 
+@@ -254,31 +303,125 @@ static ssize_t wdog_disable_set(struct device *dev,
+ static DEVICE_ATTR(disable, S_IWUSR | S_IRUSR, wdog_disable_get,
+ 							wdog_disable_set);
+ 
+-static void pet_watchdog(struct msm_watchdog_data *wdog_dd)
++static ssize_t wdog_resettype_get(struct device *dev,
++				struct device_attribute *attr, char *buf)
+ {
+-	int slack, i, count, prev_count = 0;
+-	unsigned long long time_ns;
+-	unsigned long long slack_ns;
+-	unsigned long long bark_time_ns = wdog_dd->bark_time * 1000000ULL;
++	int ret;
++	struct msm_watchdog_data *wdog_dd = dev_get_drvdata(dev);
++	ret = snprintf(buf, PAGE_SIZE, "%d\n", wdog_dd->userwd.reset_type);
++	return ret;
++}
+ 
+-	for (i = 0; i < 2; i++) {
+-		count = (__raw_readl(wdog_dd->base + WDT0_STS) >> 1) & 0xFFFFF;
+-		if (count != prev_count) {
+-			prev_count = count;
+-			i = 0;
+-		}
++static ssize_t wdog_resettype_set(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	int ret = 0;
++	u8 bitevalue;
++	struct msm_watchdog_data *wdog_dd = dev_get_drvdata(dev);
++	ret = kstrtou8(buf, 10, &bitevalue);
++	if (ret) {
++		pr_err("invalid user input\n");
++		return ret;
+ 	}
+-	slack = ((wdog_dd->bark_time * WDT_HZ) / 1000) - count;
+-	if (slack < wdog_dd->min_slack_ticks)
+-		wdog_dd->min_slack_ticks = slack;
+-	__raw_writel(1, wdog_dd->base + WDT0_RST);
+-	time_ns = sched_clock();
+-	slack_ns = (wdog_dd->last_pet + bark_time_ns) - time_ns;
+-	if (slack_ns < wdog_dd->min_slack_ns)
+-		wdog_dd->min_slack_ns = slack_ns;
+-	wdog_dd->last_pet = time_ns;
++	wdog_dd->userwd.reset_type = bitevalue;
++	return count;
++}
++static DEVICE_ATTR(resettype, S_IWUSR | S_IRUSR, wdog_resettype_get,
++							wdog_resettype_set);
++
++
++static ssize_t wdog_userpettime_get(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	int ret;
++	struct msm_watchdog_data *wdog_dd = dev_get_drvdata(dev);
++	ret = snprintf(buf, PAGE_SIZE, "%d\n", wdog_dd->userwd.user_pettime);
++	return ret;
++}
++
++#if 0
++static ssize_t wdog_userpettime_set(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	int ret = 0;
++	u32 bitevalue;
++	struct msm_watchdog_data *wdog_dd = dev_get_drvdata(dev);
++	ret = kstrtou32(buf, 10, &bitevalue);
++	if (ret) {
++		pr_err("invalid user input\n");
++		return ret;
++	}
++	wdog_dd->userwd.user_pettime = bitevalue;
++	return count;
++}
++#endif
++
++static DEVICE_ATTR(userpettime, S_IWUSR | S_IRUSR, wdog_userpettime_get, NULL);
++
++static ssize_t wdog_petwatchdog_get(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	int ret;
++	struct msm_watchdog_data *wdog_dd = dev_get_drvdata(dev);
++	ret = snprintf(buf, PAGE_SIZE, "%d\n", wdog_dd->userwd.pet_watchdog);
++	return ret;
++}
++
++static ssize_t wdog_petwatchdog_set(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	int ret = 0;
++	u8 bitevalue;
++
++	struct msm_watchdog_data *wdog_dd = dev_get_drvdata(dev);
++	ret = kstrtou8(buf, 10, &bitevalue);
++	if (ret) {
++		pr_err("invalid user input\n");
++		return ret;
++	}
++	pr_info("petwatchdog: %d\n", bitevalue);
++	wdog_dd->userwd.pet_watchdog = bitevalue;
++	if (bitevalue != 0)
++		wdog_dd->userwd.last_user_pettime = sched_clock();
++	return count;
++}
++static DEVICE_ATTR(petwatchdog, S_IWUSR | S_IRUSR, wdog_petwatchdog_get,
++							wdog_petwatchdog_set);
++
++
++
++static ssize_t wdog_userwdmode_get(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	int ret;
++	struct msm_watchdog_data *wdog_dd = dev_get_drvdata(dev);
++	ret = snprintf(buf, PAGE_SIZE, "%d\n", wdog_dd->user_watchdog_mode);
++	return ret;
+ }
+ 
++static ssize_t wdog_userwdmode_set(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	int ret = 0;
++	u8 bitevalue;
++	struct msm_watchdog_data *wdog_dd = dev_get_drvdata(dev);
++	ret = kstrtou8(buf, 10, &bitevalue);
++	if (ret) {
++		pr_err("invalid user input\n");
++		return ret;
++	}
++	wdog_dd->userwd.last_user_pettime = sched_clock();
++	wdog_dd->user_watchdog_mode = bitevalue;
++	return count;
++}
++static DEVICE_ATTR(userwdmode, S_IWUSR | S_IRUSR, wdog_userwdmode_get,
++							wdog_userwdmode_set);
++
++
+ static void keep_alive_response(void *info)
+ {
+ 	int cpu = smp_processor_id();
+@@ -318,6 +461,7 @@ static __ref int watchdog_kthread(void *arg)
+ 	struct sched_param param = {.sched_priority = MAX_RT_PRIO-1};
+ 
+ 	sched_setscheduler(current, SCHED_FIFO, &param);
++
+ 	while (!kthread_should_stop()) {
+ 		while (wait_for_completion_interruptible(
+ 			&wdog_dd->pet_complete) != 0)
+@@ -342,7 +486,6 @@ static int wdog_cpu_pm_notify(struct notifier_block *self,
+ 	int cpu;
+ 
+ 	cpu = raw_smp_processor_id();
+-
+ 	switch (action) {
+ 	case CPU_PM_ENTER:
+ 		cpu_idle_pc_state[cpu] = 1;
+@@ -387,11 +530,17 @@ void msm_trigger_wdog_bite(void)
+ {
+ 	if (!wdog_data)
+ 		return;
+-	pr_info("Causing a watchdog bite!");
+-	__raw_writel(1, wdog_data->base + WDT0_BITE_TIME);
+-	mb();
+-	__raw_writel(1, wdog_data->base + WDT0_RST);
+-	mb();
++
++	if (wdog_data->userwd.reset_type == 1) {
++		pr_err("Watchdog bite: cold boot!");
++		qpnp_pon_system_pwr_off(PON_POWER_OFF_HARD_RESET);
++	} else {
++		pr_err("Watchdog bite: warm boot");
++		__raw_writel(1, wdog_data->base + WDT0_BITE_TIME);
++		mb();
++		__raw_writel(1, wdog_data->base + WDT0_RST);
++		mb();
++	}
+ 	/* Delay to make sure bite occurs */
+ 	mdelay(10000);
+ 	pr_err("Wdog - STS: 0x%x, CTL: 0x%x, BARK TIME: 0x%x, BITE TIME: 0x%x",
+@@ -441,7 +590,6 @@ static void configure_bark_dump(struct msm_watchdog_data *wdog_dd)
+ 		int len;
+ 	} cmd_buf;
+ 	struct scm_desc desc = {0};
+-
+ 	if (MSM_DUMP_MAJOR(msm_dump_table_version()) == 1) {
+ 		wdog_dd->scm_regsave = (void *)__get_free_page(GFP_KERNEL);
+ 		if (wdog_dd->scm_regsave) {
+@@ -585,9 +733,20 @@ static void init_watchdog_data(struct msm_watchdog_data *wdog_dd)
+ 	__raw_writel(1, wdog_dd->base + WDT0_RST);
+ 	wdog_dd->last_pet = sched_clock();
+ 	wdog_dd->enabled = true;
++
++	wdog_dd->user_watchdog_mode = 0;
++	wdog_data->userwd.pet_watchdog = 0;
++	wdog_data->userwd.reset_type = 0;
++	wdog_data->userwd.user_pettime = wdog_dd->pet_time;
++
+ 	error = device_create_file(wdog_dd->dev, &dev_attr_disable);
++	error |= device_create_file(wdog_dd->dev, &dev_attr_petwatchdog);
++	error |= device_create_file(wdog_dd->dev, &dev_attr_resettype);
++	error |= device_create_file(wdog_dd->dev, &dev_attr_userpettime);
++	error |= device_create_file(wdog_dd->dev, &dev_attr_userwdmode);
+ 	if (error)
+ 		dev_err(wdog_dd->dev, "cannot create sysfs attribute\n");
++
+ 	if (wdog_dd->irq_ppi)
+ 		enable_percpu_irq(wdog_dd->bark_irq, 0);
+ 	if (ipi_opt_en)
+@@ -616,7 +775,6 @@ static int msm_wdog_dt_to_pdata(struct platform_device *pdev,
+ 	struct device_node *node = pdev->dev.of_node;
+ 	struct resource *res;
+ 	int ret;
+-
+ 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wdt-base");
+ 	if (!res)
+ 		return -ENODEV;
+-- 
+2.25.1
+

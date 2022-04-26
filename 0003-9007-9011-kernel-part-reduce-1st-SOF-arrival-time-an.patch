@@ -1,0 +1,663 @@
+From 1f898b9b2ed6a5448b5c5f1fa5df9cd4a5b12292 Mon Sep 17 00:00:00 2001
+From: fzhao <fzhao@intrinsyc.com>
+Date: Tue, 7 May 2019 16:04:28 -0700
+Subject: [PATCH 03/10]    [9007] & [9011]: kernel part: reduce 1st SOF arrival
+ time and motion interrupt handling.
+
+  1. Hanle motion sensor interrupt:
+     Start stream/stop stream.
+  2. Motion sensor mode configuration.
+  3. Reduce 1st SOF time arrive time.
+
+  Other parts:
+     /development/sample/
+     /hardware/qcom/camera/
+     /vendor/../mm-camera
+
+Change-Id: Ib382b5c0afd4b1a8681fa69242408e000260a22c
+---
+ .../qcom/apq8053-camera-sensor-dragon.dtsi    |   2 +
+ .../boot/dts/qcom/apq8053-lite-dragon.dtsi    |  16 -
+ .../platform/msm/camera_v2/ispif/msm_ispif.c  |   2 +-
+ .../msm/camera_v2/sensor/msm_sensor.c         |  16 +
+ .../msm/camera_v2/sensor/msm_sensor.h         |  32 +-
+ .../msm/camera_v2/sensor/msm_sensor_driver.c  | 378 +++++++++++-------
+ include/uapi/media/msm_cam_sensor.h           |   2 +
+ 7 files changed, 266 insertions(+), 182 deletions(-)
+ mode change 100644 => 100755 arch/arm/boot/dts/qcom/apq8053-camera-sensor-dragon.dtsi
+ mode change 100644 => 100755 arch/arm/boot/dts/qcom/apq8053-lite-dragon.dtsi
+ mode change 100644 => 100755 drivers/media/platform/msm/camera_v2/ispif/msm_ispif.c
+ mode change 100644 => 100755 drivers/media/platform/msm/camera_v2/sensor/msm_sensor.c
+ mode change 100644 => 100755 drivers/media/platform/msm/camera_v2/sensor/msm_sensor.h
+ mode change 100644 => 100755 drivers/media/platform/msm/camera_v2/sensor/msm_sensor_driver.c
+ mode change 100644 => 100755 include/uapi/media/msm_cam_sensor.h
+
+diff --git a/arch/arm/boot/dts/qcom/apq8053-camera-sensor-dragon.dtsi b/arch/arm/boot/dts/qcom/apq8053-camera-sensor-dragon.dtsi
+old mode 100644
+new mode 100755
+index 8cc92d73c9b0..a4452437c928
+--- a/arch/arm/boot/dts/qcom/apq8053-camera-sensor-dragon.dtsi
++++ b/arch/arm/boot/dts/qcom/apq8053-camera-sensor-dragon.dtsi
+@@ -181,6 +181,8 @@
+ 				<&clock_gcc clk_gcc_camss_mclk0_clk>;
+ 		clock-names = "cam_src_clk", "cam_clk";
+ 		qcom,clock-rates = <24000000 0>;
++		motion,gpio = <81>;
++		motion,timer-poll = <500>;
+ 	};
+ 
+ 	camera1: qcom,camera@1 {
+diff --git a/arch/arm/boot/dts/qcom/apq8053-lite-dragon.dtsi b/arch/arm/boot/dts/qcom/apq8053-lite-dragon.dtsi
+old mode 100644
+new mode 100755
+index b708547f3fee..18d356aab00d
+--- a/arch/arm/boot/dts/qcom/apq8053-lite-dragon.dtsi
++++ b/arch/arm/boot/dts/qcom/apq8053-lite-dragon.dtsi
+@@ -65,22 +65,6 @@
+ 		enable-active-high;
+ 	};
+ 
+-	gpio_keys {
+-		compatible = "gpio-keys";
+-		input-name = "gpio-keys";
+-		pinctrl-names = "tlmm_gpio_key_active","tlmm_gpio_key_suspend";
+-		pinctrl-0 = <&gpio_key_active>;
+-		pinctrl-1 = <&gpio_key_suspend>;
+-
+-		vol_up {
+-			label = "volume_up";
+-			gpios = <&tlmm 85 0x1>;
+-			linux,input-type = <1>;
+-			linux,code = <115>;
+-			debounce-interval = <15>;
+-		};
+-	};
+-
+ 	cnss_sdio: qcom,cnss_sdio {
+ 		compatible = "qcom,cnss_sdio";
+ 		subsys-name = "AR6320";
+diff --git a/drivers/media/platform/msm/camera_v2/ispif/msm_ispif.c b/drivers/media/platform/msm/camera_v2/ispif/msm_ispif.c
+old mode 100644
+new mode 100755
+index 61cf0d811edb..d12ff3f7983b
+--- a/drivers/media/platform/msm/camera_v2/ispif/msm_ispif.c
++++ b/drivers/media/platform/msm/camera_v2/ispif/msm_ispif.c
+@@ -47,7 +47,7 @@
+ 
+ #define ISPIF_TIMEOUT_SLEEP_US                1000
+ #define ISPIF_TIMEOUT_ALL_US               1000000
+-#define ISPIF_SOF_DEBUG_COUNT                   0
++#define ISPIF_SOF_DEBUG_COUNT                 10
+ 
+ /* 3D Threshold value according guidelines for line width 1280 */
+ #define STEREO_DEFAULT_3D_THRESHOLD           0x36
+diff --git a/drivers/media/platform/msm/camera_v2/sensor/msm_sensor.c b/drivers/media/platform/msm/camera_v2/sensor/msm_sensor.c
+old mode 100644
+new mode 100755
+index b0d521587193..9a6d5258dbd2
+--- a/drivers/media/platform/msm/camera_v2/sensor/msm_sensor.c
++++ b/drivers/media/platform/msm/camera_v2/sensor/msm_sensor.c
+@@ -1378,6 +1378,22 @@ int msm_sensor_config(struct msm_sensor_ctrl_t *s_ctrl, void __user *argp)
+ 		break;
+ 	}
+ 
++	case CFG_SET_FLOCK_MODE_ON:
++		s_ctrl->motion_dev.motion_interrupt_mode = true;
++		if (s_ctrl->motion_dev.irq_motion) {
++			enable_irq(s_ctrl->motion_dev.irq_motion);
++		}
++		pr_err("%s: Flock mode on and enable irq\n", __func__);
++		break;
++
++	case CFG_SET_FLOCK_MODE_OFF:
++		s_ctrl->motion_dev.motion_interrupt_mode = false;
++		s_ctrl->motion_dev.is_start_camera = false;
++		if (s_ctrl->motion_dev.irq_motion) {
++			disable_irq(s_ctrl->motion_dev.irq_motion);
++		}
++		pr_err("%s: Flock mode off and disable irq\n", __func__);
++		break;
+ 	default:
+ 		rc = -EFAULT;
+ 		break;
+diff --git a/drivers/media/platform/msm/camera_v2/sensor/msm_sensor.h b/drivers/media/platform/msm/camera_v2/sensor/msm_sensor.h
+old mode 100644
+new mode 100755
+index 68e47afa78dc..4bc74b2a9f03
+--- a/drivers/media/platform/msm/camera_v2/sensor/msm_sensor.h
++++ b/drivers/media/platform/msm/camera_v2/sensor/msm_sensor.h
+@@ -65,6 +65,19 @@ struct msm_sensor_fn_t {
+ 	int (*sensor_match_id)(struct msm_sensor_ctrl_t *);
+ };
+ 
++struct msm_motion_dev_t {
++	struct work_struct camera_work;
++	struct timer_list timer;
++	struct mutex *msm_motion_sensor_mutex;
++	bool motion_interrupt_mode;
++	spinlock_t lock;
++	int gpio_motion;
++	int irq_motion;	
++	unsigned long motion_interrupt_time;
++	bool is_start_camera;
++	unsigned int timer_poll;	/* in msecs */
++};
++
+ struct msm_sensor_ctrl_t {
+ 	struct platform_device *pdev;
+ 	struct mutex *msm_sensor_mutex;
+@@ -92,24 +105,7 @@ struct msm_sensor_ctrl_t {
+ 	uint8_t is_csid_tg_mode;
+ 	uint32_t is_secure;
+ 	uint8_t bypass_video_node_creation;
+-	/* motion sensor Interrupt */
+-	struct mutex *msm_motion_sensor_mutex;
+-	/* motion sensor Interrupt GPIO */
+-	int gpio_motion;
+-	/* motion sensor status */
+-	int irq_motion;
+-	/* worker to handle interrupts */
+-	struct delayed_work irq_delayed_work;
+-	/* add motion sensor interrupt handler */
+-	unsigned long last_interrupt_time;
+-#ifdef MOTION_SENSOR_DEBUG
+-	unsigned long last_open_camera_time;
+-	unsigned long last_close_camera_time;
+-#endif
+-	bool is_camera_started;
+-	bool delay_work_active;
+-        /* worker to send frame */
+-	struct delayed_work send_frame_delayed_work;
++	struct msm_motion_dev_t motion_dev;
+ };
+ 
+ int msm_sensor_config(struct msm_sensor_ctrl_t *s_ctrl, void __user *argp);
+diff --git a/drivers/media/platform/msm/camera_v2/sensor/msm_sensor_driver.c b/drivers/media/platform/msm/camera_v2/sensor/msm_sensor_driver.c
+old mode 100644
+new mode 100755
+index ad9d353023c5..456db8c2976b
+--- a/drivers/media/platform/msm/camera_v2/sensor/msm_sensor_driver.c
++++ b/drivers/media/platform/msm/camera_v2/sensor/msm_sensor_driver.c
+@@ -32,25 +32,7 @@ static int32_t msm_sensor_driver_platform_probe(struct platform_device *pdev);
+ static struct msm_sensor_ctrl_t *g_sctrl[MAX_CAMERAS];
+ 
+ /* motion sensor */
+-#define MOTION_SENSOR_GPIO  81                //motion sensor gpio
+-#define TIMER_INTERVAL  2000                  //2000ms
+-#define SEND_FRAME_TIMER_INTERVAL  200        //200ms
+-
+-
+-static void start_camera(void)
+-{
+-	// add start camera code here
+-}
+-
+-static void close_camera(void)
+-{
+-	// add close camera code here
+-}
+-
+-static void send_frame(void)
+-{
+-	// add send frame code here
+-}
++#define TIMER_INTERVAL  5000                  
+ 
+ static int msm_sensor_platform_remove(struct platform_device *pdev)
+ {
+@@ -66,7 +48,7 @@ static int msm_sensor_platform_remove(struct platform_device *pdev)
+ 
+ 	msm_sensor_free_sensor_data(s_ctrl);
+ 	kfree(s_ctrl->msm_sensor_mutex);
+-	kfree(s_ctrl->msm_motion_sensor_mutex);
++	kfree(s_ctrl->motion_dev.msm_motion_sensor_mutex);
+ 	kfree(s_ctrl->sensor_i2c_client);
+ 	kfree(s_ctrl);
+ 	g_sctrl[pdev->id] = NULL;
+@@ -700,104 +682,237 @@ static void msm_sensor_fill_sensor_info(struct msm_sensor_ctrl_t *s_ctrl,
+ 	strlcpy(entity_name, s_ctrl->msm_sd.sd.entity.name, MAX_SENSOR_NAME);
+ }
+ 
+-static irqreturn_t motion_irq(int irq, void *dev)
++//For Flock
++static struct msm_camera_i2c_reg_array stop_reg_settings[] = {
++  {0x100,0x0,0},
++};
++static struct msm_camera_i2c_reg_array start_reg_settings[] = {
++/*  {0x0100,0x00, 0x00},
++  {0x0100,0x00, 0x00}, 
++  {0x3035,0x21, 0x00}, 
++  {0x3036,0x64, 0x00}, 
++  {0x3821,0x00, 0x00}, 
++  {0x3820,0x06, 0x00}, 
++  {0x3612,0x5B, 0x00}, 
++  {0x3618,0x04, 0x00}, 
++  {0x380c,0x0A, 0x00}, 
++  {0x380d,0x8C, 0x00}, 
++  {0x380e,0x07, 0x00}, 
++  {0x380f,0xB6, 0x00}, 
++  {0x3814,0x11, 0x00}, 
++  {0x3815,0x11, 0x00}, 
++  {0x3709,0x12, 0x00}, 
++  {0x3808,0x0a, 0x00}, 
++  {0x3809,0x20, 0x00}, 
++  {0x380a,0x07, 0x00}, 
++  {0x380b,0x98, 0x00}, 
++  {0x3800,0x00, 0x00}, 
++  {0x3801,0x0c, 0x00}, 
++  {0x3802,0x00, 0x00}, 
++  {0x3803,0x04, 0x00}, 
++  {0x3804,0x0a, 0x00}, 
++  {0x3805,0x33, 0x00}, 
++  {0x3806,0x07, 0x00}, 
++  {0x3807,0xa3, 0x00}, 
++  {0x4004,0x04, 0x00}, 
++  {0x4837,0x19, 0x00}, 
++  {0x0100,0x00, 0x00}, 
++  {0x3036,0x46, 0x00}, 
++  {0x3612,0x59, 0x00}, 
++  {0x3618,0x00, 0x00}, 
++  {0x3709,0x52, 0x00}, 
++  {0x3800,0x00, 0x00}, 
++  {0x3801,0x08, 0x00}, 
++  {0x3802,0x00, 0x00}, 
++  {0x3803,0x02, 0x00}, 
++  {0x3804,0x0a, 0x00}, 
++  {0x3805,0x37, 0x00}, 
++  {0x3806,0x07, 0x00}, 
++  {0x3807,0xa1, 0x00}, 
++  {0x3808,0x05, 0x00}, 
++  {0x3809,0x10, 0x00}, 
++  {0x380a,0x03, 0x00}, 
++  {0x380b,0xcc, 0x00}, 
++  {0x380c,0x07, 0x00}, 
++  {0x380d,0x68, 0x00}, 
++  {0x380e,0x03, 0x00}, 
++  {0x380f,0xd8, 0x00}, 
++  {0x3814,0x31, 0x00}, 
++  {0x3815,0x31, 0x00}, 
++  {0x3821,0x01, 0x00}, 
++  {0x3820,0x47, 0x00}, 
++  {0x3a09,0x27, 0x00}, 
++  {0x3a0a,0x00, 0x00}, 
++  {0x3a0b,0xf6, 0x00}, 
++  {0x3a0d,0x04, 0x00}, 
++  {0x3a0e,0x03, 0x00}, 
++  {0x4004,0x02, 0x00}, 
++  {0x4005,0x18, 0x00}, 
++  {0x4837,0x23, 0x05},*/
++  {0x0100,0x01, 0x00},
++};
++
++#define size_of_array(table) (sizeof(table)/sizeof(table[0]))
++
++static void gpio_motion_camera_work_func(struct work_struct *work)
+ {
+-	struct msm_sensor_ctrl_t *s_ctrl = dev;
+-	unsigned long irq_interval;
+-	irq_interval = jiffies - s_ctrl->last_interrupt_time;
+-	s_ctrl->last_interrupt_time = jiffies;
+-	pr_info("%s: MotionSensor: motion sensor irq_interval  =  %d ms \n", __func__, jiffies_to_msecs(irq_interval));
+-	pr_info("%s: MotionSensor: received motion interrupt:0x%x \n",
+-		__func__, s_ctrl->sensordata->slave_info->sensor_slave_addr);
+-	if(s_ctrl->delay_work_active) {
+-		if(cancel_delayed_work(&s_ctrl->irq_delayed_work)) {
+-			pr_info("%s: MotionSensor: cancel_delayed_work()  successfully! \n", __func__);
+-		}
+-		else {
+-			pr_err("%s: MotionSensor:  failed to cancel_delayed_work()! \n", __func__);
+-		}
+-	} else {
+-		pr_info("%s: MotionSensor: no active motion_irq_delay_work! \n", __func__);
++	int32_t rc = 0;
++	struct msm_camera_i2c_reg_setting conf_array;
++
++	struct msm_sensor_ctrl_t *s_ctrl = 
++								container_of(work, struct msm_sensor_ctrl_t, motion_dev.camera_work); 
++
++	mutex_lock(s_ctrl->motion_dev.msm_motion_sensor_mutex);		
++	conf_array.addr_type = MSM_CAMERA_I2C_WORD_ADDR;
++	conf_array.data_type = MSM_CAMERA_I2C_BYTE_DATA;
++	conf_array.delay     = 0;
++
++	if (s_ctrl->motion_dev.is_start_camera) {
++		conf_array.size = size_of_array(start_reg_settings);
++		conf_array.reg_setting = &start_reg_settings[0];
++		pr_err("%s: FlockCamera start camera stream. size: %d\n", __func__,conf_array.size);
++	} else 
++	{
++		conf_array.size = size_of_array(stop_reg_settings);
++		conf_array.reg_setting = &stop_reg_settings[0];
++		pr_err("%s: FlockCamera stop camera stream. size: %d\n", __func__,conf_array.size);
+ 	}
+ 
+-	pr_info("%s: MotionSensor:  schedule_delayed_work(motion_irq_delay_work, %d) \n", __func__, TIMER_INTERVAL);
+-	schedule_delayed_work(&s_ctrl->irq_delayed_work,
+-						msecs_to_jiffies(TIMER_INTERVAL));
+-	s_ctrl->delay_work_active = true;
+-	if(!s_ctrl->is_camera_started) {
+-		pr_info("%s: MotionSensor: start_camera()\n", __func__);
+-		start_camera();
+-#ifdef MOTION_SENSOR_DEBUG
+-		s_ctrl->last_open_camera_time = jiffies;
+-#endif
+-		s_ctrl->is_camera_started = true;
+-		pr_info("%s: MotionSensor:  schedule_delayed_work(camera_send_frame_delay_work,%d)  \n", __func__, SEND_FRAME_TIMER_INTERVAL);
+-		//if camera is active, schedule send frame work after 200ms
+-		schedule_delayed_work(&s_ctrl->send_frame_delayed_work, msecs_to_jiffies(SEND_FRAME_TIMER_INTERVAL));
++	rc = s_ctrl->sensor_i2c_client->i2c_func_tbl->
++				i2c_write_table(s_ctrl->sensor_i2c_client,
++					&conf_array);
++
++	mutex_unlock(s_ctrl->motion_dev.msm_motion_sensor_mutex);
++
++}
++
++static void motion_interrupt_poll_timer(unsigned long _data)
++{
++	struct msm_sensor_ctrl_t *s_ctrl = (struct msm_sensor_ctrl_t *)_data;
++	long motion_interrupt_interval = jiffies_to_msecs(jiffies - s_ctrl->motion_dev.motion_interrupt_time);
++	if(motion_interrupt_interval > TIMER_INTERVAL) {
++		if (s_ctrl->motion_dev.is_start_camera) {
++			pr_info("%s: MotionSensor: stop camera streaming\n", __func__);
++			schedule_work(&s_ctrl->motion_dev.camera_work);
++			s_ctrl->motion_dev.is_start_camera = false;
++		}
++	} 
++	if (s_ctrl->motion_dev.is_start_camera == false)
++	{
++	  	mod_timer(&s_ctrl->motion_dev.timer, jiffies + 10*HZ);
++	} else
++	{
++		mod_timer(&s_ctrl->motion_dev.timer,
++			jiffies + msecs_to_jiffies(s_ctrl->motion_dev.timer_poll));
+ 	}
+-	return IRQ_HANDLED;
+ }
+ 
+-static void motion_irq_delay_work(struct work_struct *work)
++static irqreturn_t gpio_motion_irq_isr(int irq, void *dev_id)
+ {
+-	struct msm_sensor_ctrl_t *s_ctrl;
+-	s_ctrl = container_of(work, struct msm_sensor_ctrl_t,
+-                                irq_delayed_work.work);
+-	if (!s_ctrl) {
+-		pr_err("%s:%d MotionSensor: motion_irq_delay_work failed: %pK\n",
+-				__func__, __LINE__, s_ctrl);
+-		goto exit_queue;
+-	}
+-	pr_info("%s: MotionSensor: current time - s_ctrl->last_interrupt_time =  %d ms \n", __func__, jiffies_to_msecs(jiffies - s_ctrl->last_interrupt_time));
+-	mutex_lock(s_ctrl->msm_motion_sensor_mutex);
+-	if(s_ctrl->is_camera_started) {
+-		pr_info("%s: MotionSensor: close_camera()  \n", __func__);
+-		close_camera();
+-#ifdef MOTION_SENSOR_DEBUG
+-		s_ctrl->last_close_camera_time = jiffies;
+-		pr_info("%s: MotionSensor: open and close camera interval time =  %d ms \n", __func__,
+-					jiffies_to_msecs(s_ctrl->last_close_camera_time - s_ctrl->last_open_camera_time));
+-#endif
+-		s_ctrl->is_camera_started = false;
+-		if(cancel_delayed_work(&s_ctrl->send_frame_delayed_work)) {
+-			pr_info("%s: MotionSensor: cancel_delayed_work(send_frame_delayed_work)  successfully! \n", __func__);
+-		} else {
+-			pr_err("%s: MotionSensor:  failed to cancel_delayed_work(send_frame_delayed_work)! \n", __func__);
++	struct msm_sensor_ctrl_t *s_ctrl = dev_id;
++	unsigned long flags;
++
++	BUG_ON(irq != s_ctrl->motion_dev.irq_motion);
++	spin_lock_irqsave(&s_ctrl->motion_dev.lock, flags);
++
++	if(!s_ctrl->motion_dev.is_start_camera && s_ctrl->motion_dev.motion_interrupt_mode) {
++		pr_info("%s: MotionSensor: start_camera()\n", __func__);
++		schedule_work(&s_ctrl->motion_dev.camera_work);
++		s_ctrl->motion_dev.is_start_camera = true;
++		if (s_ctrl->motion_dev.timer_poll) {
++			mod_timer(&s_ctrl->motion_dev.timer,
++				jiffies + msecs_to_jiffies(s_ctrl->motion_dev.timer_poll));
+ 		}
+ 	}
+-	s_ctrl->delay_work_active = false;
+-	mutex_unlock(s_ctrl->msm_motion_sensor_mutex);
+-exit_queue:
+-	pr_info("%s: MotionSensor: Motion Work IRQ exit\n", __func__);
++	s_ctrl->motion_dev.motion_interrupt_time = jiffies;
++
++	spin_unlock_irqrestore(&s_ctrl->motion_dev.lock, flags);
++	return IRQ_HANDLED;
+ }
+ 
+-static void camera_send_frame_delay_work(struct work_struct *work)
++static int motion_interrupt_setup(struct platform_device *pdev, struct msm_sensor_ctrl_t *s_ctrl)
+ {
+-	struct msm_sensor_ctrl_t *s_ctrl;
+-	s_ctrl = container_of(work, struct msm_sensor_ctrl_t,
+-                                send_frame_delayed_work.work);
+-	if (!s_ctrl) {
+-		pr_err("%s:%d MotionSensor:  camera_send_frame_delay_work() failed: %pK\n",
+-				__func__, __LINE__, s_ctrl);
+-		goto exit_queue;
+-	}
+-	mutex_lock(s_ctrl->msm_motion_sensor_mutex);
+-	if(s_ctrl->is_camera_started) {
+-		//if camera is active, schedule send frame work every 200ms
+-		schedule_delayed_work(&s_ctrl->send_frame_delayed_work, msecs_to_jiffies(SEND_FRAME_TIMER_INTERVAL));
+-		pr_info("%s: MotionSensor:  send_frame() \n", __func__);
+-		send_frame();
+-	} else {
+-		if(cancel_delayed_work(&s_ctrl->send_frame_delayed_work)) {
+-			pr_info("%s: otionSensor: cancel_delayed_work(send_frame_delayed_work)  successfully! \n", __func__);
+-		} else {
+-			pr_err("%s: MotionSensor:  failed to cancel_delayed_work(send_frame_delayed_work)! \n", __func__);
++	struct device *dev = &pdev->dev;
++	irq_handler_t isr;
++	int rc;
++	unsigned long irqflags;
++	int irq;
++	int error = -1;
++	struct device_node                  *of_node = s_ctrl->of_node;
++
++	if (!pdev || !s_ctrl) {
++		pr_err("%s:failed\n", __func__);
++		return error;
++	}
++	rc = of_property_read_u32(of_node, "motion,gpio",
++		&s_ctrl->motion_dev.gpio_motion);
++	pr_err("qcom, motion inteerupt GPIO = %d, rc %d", s_ctrl->motion_dev.gpio_motion, rc);
++	if (rc < 0) {
++		s_ctrl->motion_dev.gpio_motion = 81;
++		rc = 0;
++	}
++
++	rc = of_property_read_u32(of_node, "motion,timer-poll",
++		&s_ctrl->motion_dev.timer_poll);
++	pr_err("qcom, motion timer poll = %d, rc %d", s_ctrl->motion_dev.timer_poll, rc);
++	if (rc < 0) {
++		s_ctrl->motion_dev.timer_poll = 1000;
++		rc = 0;
++	}
++
++	s_ctrl->motion_dev.motion_interrupt_mode = false;
++	s_ctrl->motion_dev.is_start_camera = false;
++	spin_lock_init(&s_ctrl->motion_dev.lock);
++
++	if (gpio_is_valid(s_ctrl->motion_dev.gpio_motion)) {
++
++		error = devm_gpio_request_one(dev, s_ctrl->motion_dev.gpio_motion,
++						  GPIOF_IN, "motion_interrupt");
++		if (error < 0) {
++			dev_err(dev, "Failed to request GPIO %d, error %d\n",
++				s_ctrl->motion_dev.gpio_motion, error);
++			return error;
++		}
++
++		if (s_ctrl->motion_dev.timer_poll)
++		{
++			pr_info("%s: set debounce \n", __func__);
++			error = gpio_set_debounce(s_ctrl->motion_dev.gpio_motion,
++						s_ctrl->motion_dev.timer_poll * 1000);
++			if (error < 0)
++			{
++				pr_info("%s: gpiolib does not provide debounce \n", __func__);
++			}
++		}
++
++		pr_info("%s: MotionSensor: call gpio_to_irq(s_ctrl->motion_dev.gpio_motion)  \n", __func__);
++		irq = gpio_to_irq(s_ctrl->motion_dev.gpio_motion);
++		if (irq < 0) {
++			error = irq;
++			dev_err(dev,
++				"Unable to get irq number for GPIO %d, error %d\n",
++				s_ctrl->motion_dev.gpio_motion, error);
++			return error;
++		}
++		s_ctrl->motion_dev.irq_motion = irq;
++		disable_irq(s_ctrl->motion_dev.irq_motion);
++		INIT_WORK(&s_ctrl->motion_dev.camera_work, gpio_motion_camera_work_func);
++		setup_timer(&s_ctrl->motion_dev.timer,
++		    motion_interrupt_poll_timer, (unsigned long)s_ctrl);
++
++		isr = gpio_motion_irq_isr;
++		irqflags = IRQF_TRIGGER_RISING;
++		error = devm_request_any_context_irq(dev, s_ctrl->motion_dev.irq_motion,
++				     isr, irqflags, "motion_interrupt", s_ctrl);
++		if (error < 0) {
++			dev_err(dev, "Unable to claim irq %d; error %d\n",
++				s_ctrl->motion_dev.irq_motion, error);
++			return error;
+ 		}
+ 	}
+-	mutex_unlock(s_ctrl->msm_motion_sensor_mutex);
+-exit_queue:
+-	pr_info("%s: MotionSensor: Send Frame Work Queue exit\n", __func__);
++	return 0;
+ }
++//--Flock
+ 
+ /* static function definition */
+ int32_t msm_sensor_driver_probe(void *setting,
+@@ -1145,42 +1260,6 @@ CSID_TG:
+ 
+ 	msm_sensor_fill_sensor_info(s_ctrl, probed_info, entity_name);
+ 
+-	/* motion sensor interrupt */
+-	s_ctrl->last_interrupt_time = 0;
+-#ifdef MOTION_SENSOR_DEBUG
+-	s_ctrl->last_open_camera_time = 0;
+-	s_ctrl->last_close_camera_time = 0;
+-#endif
+-	s_ctrl->is_camera_started = false;
+-	s_ctrl->delay_work_active = false;
+-	s_ctrl->gpio_motion = MOTION_SENSOR_GPIO;
+-	INIT_DELAYED_WORK(&s_ctrl->irq_delayed_work,
+-			motion_irq_delay_work);
+-	pr_info("%s: MotionSensor: call gpio_to_irq(s_ctrl->gpio_motion)  \n", __func__);
+-	s_ctrl->irq_motion = gpio_to_irq(s_ctrl->gpio_motion);
+-	if (s_ctrl->irq_motion) {
+-		pr_info("%s: MotionSensor: call request_irq()  \n", __func__);
+-		rc = request_irq(s_ctrl->irq_motion, motion_irq,
+-				IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+-				"qcom,camera", s_ctrl);
+-		if (rc) {
+-			pr_err("%s: MotionSensor: Failed request_irq %d \n",
+-					__func__, rc);
+-			goto cancel_work;
+-		}
+-
+-	} else {
+-		pr_err("%s: MotionSensor: Failed gpio_to_irq %d \n",
+-			__func__, rc);
+-		rc = -EINVAL;
+-		goto cancel_work;
+-	}
+-
+-	//setup send frame condition
+-	pr_info("%s: MotionSensor: setup send frame work INIT_DELAYED_WORK(camera_send_frame_delay_work) \n", __func__);
+-	INIT_DELAYED_WORK(&s_ctrl->send_frame_delayed_work,
+-                        camera_send_frame_delay_work);
+-
+ 	/*
+ 	 * Set probe succeeded flag to 1 so that no other camera shall
+ 	 * probed on this slot
+@@ -1190,8 +1269,6 @@ CSID_TG:
+ 
+ camera_power_down:
+ 	s_ctrl->func_tbl->sensor_power_down(s_ctrl);
+-cancel_work:
+-	cancel_delayed_work(&s_ctrl->irq_delayed_work);
+ free_camera_info:
+ 	kfree(camera_info);
+ free_slave_info:
+@@ -1355,11 +1432,11 @@ static int32_t msm_sensor_driver_parse(struct msm_sensor_ctrl_t *s_ctrl)
+ 		goto FREE_SENSOR_I2C_CLIENT;
+ 	}
+ 
+-	s_ctrl->msm_motion_sensor_mutex = kzalloc(sizeof(*s_ctrl->msm_motion_sensor_mutex),
++	s_ctrl->motion_dev.msm_motion_sensor_mutex = kzalloc(sizeof(*s_ctrl->motion_dev.msm_motion_sensor_mutex),
+ 		GFP_KERNEL);
+-	if (!s_ctrl->msm_motion_sensor_mutex) {
++	if (!s_ctrl->motion_dev.msm_motion_sensor_mutex) {
+ 		pr_err("failed: no memory msm_motion_sensor_mutex %pK",
+-			s_ctrl->msm_motion_sensor_mutex);
++			s_ctrl->motion_dev.msm_motion_sensor_mutex);
+ 		rc = -ENOMEM;
+ 		goto FREE_SENSOR_I2C_CLIENT;
+ 	}
+@@ -1373,7 +1450,7 @@ static int32_t msm_sensor_driver_parse(struct msm_sensor_ctrl_t *s_ctrl)
+ 
+ 	/* Initialize mutex */
+ 	mutex_init(s_ctrl->msm_sensor_mutex);
+-	mutex_init(s_ctrl->msm_motion_sensor_mutex);
++	mutex_init(s_ctrl->motion_dev.msm_motion_sensor_mutex);
+ 
+ 	/* Initilize v4l2 subdev info */
+ 	s_ctrl->sensor_v4l2_subdev_info = msm_sensor_driver_subdev_info;
+@@ -1402,7 +1479,7 @@ FREE_DT_DATA:
+ 	kfree(s_ctrl->sensordata);
+ FREE_MUTEX:
+ 	kfree(s_ctrl->msm_sensor_mutex);
+-	kfree(s_ctrl->msm_motion_sensor_mutex);
++	kfree(s_ctrl->motion_dev.msm_motion_sensor_mutex);
+ FREE_SENSOR_I2C_CLIENT:
+ 	kfree(s_ctrl->sensor_i2c_client);
+ 	return rc;
+@@ -1448,6 +1525,13 @@ static int32_t msm_sensor_driver_platform_probe(struct platform_device *pdev)
+ 
+ 	/* Fill device in power info */
+ 	s_ctrl->sensordata->power_info.dev = &pdev->dev;
++
++	/*Flock*/
++	rc = motion_interrupt_setup(pdev, s_ctrl);
++	if (rc < 0 )
++	{
++		pr_err("failed: setup Motion interrupt mode rc %d", rc);
++	}
+ 	return rc;
+ FREE_S_CTRL:
+ 	kfree(s_ctrl);
+@@ -1521,7 +1605,7 @@ static int msm_sensor_driver_i2c_remove(struct i2c_client *client)
+ 	g_sctrl[s_ctrl->id] = NULL;
+ 	msm_sensor_free_sensor_data(s_ctrl);
+ 	kfree(s_ctrl->msm_sensor_mutex);
+-	kfree(s_ctrl->msm_motion_sensor_mutex);
++	kfree(s_ctrl->motion_dev.msm_motion_sensor_mutex);
+ 	kfree(s_ctrl->sensor_i2c_client);
+ 	kfree(s_ctrl);
+ 
+diff --git a/include/uapi/media/msm_cam_sensor.h b/include/uapi/media/msm_cam_sensor.h
+old mode 100644
+new mode 100755
+index 5b164a8fbf00..86cda8c6af6b
+--- a/include/uapi/media/msm_cam_sensor.h
++++ b/include/uapi/media/msm_cam_sensor.h
+@@ -342,6 +342,8 @@ enum msm_sensor_cfg_type_t {
+ 	CFG_WRITE_I2C_ARRAY_ASYNC,
+ 	CFG_WRITE_I2C_ARRAY_SYNC,
+ 	CFG_WRITE_I2C_ARRAY_SYNC_BLOCK,
++	CFG_SET_FLOCK_MODE_ON,
++	CFG_SET_FLOCK_MODE_OFF,
+ };
+ 
+ enum msm_actuator_cfg_type_t {
+-- 
+2.25.1
+
